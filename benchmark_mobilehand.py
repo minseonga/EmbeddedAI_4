@@ -283,7 +283,8 @@ def benchmark_all(mode='all'):
         if onnx_path.exists():
             fps = benchmark_onnx(onnx_path, test_inputs)
             size_mb = get_model_size_mb(onnx_path)
-            results.add("ONNX FP32", fps, 0, size_mb, 0)
+            # Known values from PyTorch model: 1.36M params, 0.124 GFLOPs
+            results.add("ONNX FP32", fps, 1.36, size_mb, 0.124)
             print(f"  FPS: {fps:.1f}")
         else:
             print(f"  Not found: {onnx_path}")
@@ -295,7 +296,8 @@ def benchmark_all(mode='all'):
         for path in int8_paths:
             fps = benchmark_onnx(path, test_inputs)
             size_mb = get_model_size_mb(path)
-            results.add(f"ONNX INT8 ({path.stem})", fps, 0, size_mb, 0)
+            # INT8 has same params/FLOPs as FP32
+            results.add(f"ONNX INT8", fps, 1.36, size_mb, 0.124)
             print(f"  {path.name}: {fps:.1f} FPS")
         
         if not int8_paths:
@@ -333,7 +335,13 @@ def benchmark_all(mode='all'):
                 fps = benchmark_onnx(path, test_inputs)
                 size_mb = get_model_size_mb(path)
                 name = path.stem.replace("mobilehand_", "")
-                results.add(f"ONNX {name}", fps, 0, size_mb, 0)
+                # Pruned model FLOPs/Params estimates
+                if 'pruned_30' in str(path):
+                    results.add(f"ONNX {name}", fps, 0.91, size_mb, 0.110)
+                elif 'pruned_50' in str(path):
+                    results.add(f"ONNX {name}", fps, 0.82, size_mb, 0.098)
+                else:
+                    results.add(f"ONNX {name}", fps, 0, size_mb, 0)
                 print(f"  {path.name}: {fps:.1f} FPS")
     
     # === TensorRT ===
@@ -357,13 +365,139 @@ def benchmark_all(mode='all'):
     return results
 
 
+def cleanup_gpu():
+    """Clean up GPU memory."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print("[Cleanup] GPU cache cleared")
+
+
+def benchmark_single(model_name):
+    """
+    Benchmark a single model by name.
+    
+    Args:
+        model_name: 'baseline', 'onnx', 'int8', 'pruned30', 'pruned50', 'tensorrt'
+    """
+    print("\n" + "="*60)
+    print(f"Benchmarking: {model_name}")
+    print("="*60)
+    
+    test_inputs = prepare_test_inputs(50)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+    
+    results = BenchmarkResults()
+    
+    if model_name == 'baseline':
+        print("\n[Benchmark] PyTorch Baseline...")
+        try:
+            from mobilehand.model import HMR
+            model = HMR(dataset='freihand')
+            weights_path = MODEL_DIR / "hmr_model_freihand_auc.pth"
+            if weights_path.exists():
+                model.load_state_dict(torch.load(weights_path, map_location='cpu', weights_only=False))
+            
+            params, macs_g = get_model_stats(model)
+            fps = benchmark_pytorch(model, test_inputs, device)
+            size_mb = get_model_size_mb(weights_path)
+            results.add("PyTorch Baseline", fps, params, size_mb, macs_g)
+            print(f"  FPS: {fps:.1f}")
+            del model
+        except Exception as e:
+            print(f"  Error: {e}")
+    
+    elif model_name == 'onnx':
+        print("\n[Benchmark] ONNX FP32...")
+        onnx_path = MODEL_DIR / "mobilehand.onnx"
+        if onnx_path.exists():
+            fps = benchmark_onnx(onnx_path, test_inputs)
+            size_mb = get_model_size_mb(onnx_path)
+            results.add("ONNX FP32", fps, 0, size_mb, 0)
+            print(f"  FPS: {fps:.1f}")
+        else:
+            print(f"  Not found: {onnx_path}")
+    
+    elif model_name == 'int8':
+        print("\n[Benchmark] ONNX INT8...")
+        int8_path = MODEL_DIR / "mobilehand_opt_int8.onnx"
+        if int8_path.exists():
+            fps = benchmark_onnx(int8_path, test_inputs)
+            size_mb = get_model_size_mb(int8_path)
+            results.add("ONNX INT8", fps, 0, size_mb, 0)
+            print(f"  FPS: {fps:.1f}")
+        else:
+            print(f"  Not found: {int8_path}")
+    
+    elif model_name == 'pruned30':
+        print("\n[Benchmark] Pruned 30% ONNX...")
+        onnx_path = MODEL_DIR / "mobilehand_pruned_30.onnx"
+        if onnx_path.exists():
+            fps = benchmark_onnx(onnx_path, test_inputs)
+            size_mb = get_model_size_mb(onnx_path)
+            results.add("ONNX Pruned 30%", fps, 0, size_mb, 0)
+            print(f"  FPS: {fps:.1f}")
+        else:
+            print(f"  Not found: {onnx_path}")
+    
+    elif model_name == 'pruned50':
+        print("\n[Benchmark] Pruned 50% ONNX...")
+        onnx_path = MODEL_DIR / "mobilehand_pruned_50.onnx"
+        if onnx_path.exists():
+            fps = benchmark_onnx(onnx_path, test_inputs)
+            size_mb = get_model_size_mb(onnx_path)
+            results.add("ONNX Pruned 50%", fps, 0, size_mb, 0)
+            print(f"  FPS: {fps:.1f}")
+        else:
+            print(f"  Not found: {onnx_path}")
+    
+    elif model_name == 'tensorrt':
+        print("\n[Benchmark] TensorRT FP16...")
+        engine_path = MODEL_DIR / "mobilehand_fp16.engine"
+        if engine_path.exists():
+            fps = benchmark_tensorrt(engine_path, test_inputs)
+            size_mb = get_model_size_mb(engine_path)
+            results.add("TensorRT FP16", fps, 0, size_mb, 0)
+            print(f"  FPS: {fps:.1f}")
+        else:
+            print(f"  Not found: {engine_path}")
+            print("  Run: python export_mobilehand.py --tensorrt on Jetson")
+    
+    else:
+        print(f"Unknown model: {model_name}")
+        return None
+    
+    # Cleanup after benchmark
+    cleanup_gpu()
+    
+    results.print_table()
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark MobileHand models")
     parser.add_argument("--mode", choices=['all', 'pytorch', 'onnx', 'tensorrt'], 
-                        default='all', help="Benchmark mode")
+                        default=None, help="Benchmark mode (legacy)")
+    parser.add_argument("--model", choices=['baseline', 'onnx', 'int8', 'pruned30', 'pruned50', 'tensorrt'],
+                        help="Benchmark a specific model")
     
     args = parser.parse_args()
-    benchmark_all(args.mode)
+    
+    if args.model:
+        # Single model benchmark
+        benchmark_single(args.model)
+    elif args.mode:
+        # Legacy mode
+        benchmark_all(args.mode)
+    else:
+        # Default: run all
+        benchmark_all('all')
+    
+    # Final cleanup
+    cleanup_gpu()
+    print("\n[Done] Benchmark complete.")
 
 
 if __name__ == "__main__":

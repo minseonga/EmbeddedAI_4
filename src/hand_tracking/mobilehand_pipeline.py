@@ -6,7 +6,6 @@ from pathlib import Path
 # Import MediaPipe solutions
 from mediapipe.python.solutions import face_mesh as mp_face_mesh
 from mediapipe.python.solutions import hands as mp_hands
-from mobilehand.model import HMR
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,14 +23,17 @@ class MobileHandPipeline:
     Hybrid Pipeline:
     1. MediaPipe Hands for palm detection (bounding boxes)
     2. Crop each detected hand region
-    3. MobileHand for 21-keypoint estimation on each crop
+    3. MobileHand for 21-keypoint estimation on each crop (PyTorch or ONNX)
     4. MediaPipe Face Mesh for face/mouth tracking
     """
     
-    def __init__(self, model_path=None, max_hands=2):
+    def __init__(self, model_path=None, max_hands=2, use_onnx=True, onnx_variant='int8'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.available = False
         self.model = None
+        self.onnx_session = None
+        self.use_onnx = use_onnx and onnx_variant != 'pytorch'
+        self.onnx_variant = onnx_variant
         self.max_hands = max_hands
         
         # Locate project root
@@ -58,9 +60,64 @@ class MobileHandPipeline:
         )
         print("[Pipeline] MediaPipe Hands loaded (palm detection)")
         
-        # === 3. Initialize MobileHand model ===
+        # === 3. Initialize MobileHand model (ONNX or PyTorch) ===
+        if self.use_onnx:
+            self._init_onnx()
+        else:
+            self._init_pytorch(model_path)
+
+    def _init_onnx(self):
+        """Initialize ONNX Runtime for MobileHand inference."""
         try:
-            logger.info("Initializing MobileHand model...")
+            import onnxruntime as ort
+            
+            # Select model based on variant
+            model_map = {
+                'fp32': self.root / 'assets/models/mobilehand.onnx',
+                'int8': self.root / 'assets/models/mobilehand_opt_int8.onnx',
+                'pruned30': self.root / 'assets/models/mobilehand_pruned_30.onnx',
+                'pruned50': self.root / 'assets/models/mobilehand_pruned_50.onnx',
+            }
+            
+            onnx_path = model_map.get(self.onnx_variant)
+            
+            # Fallback chain if specified model doesn't exist
+            if onnx_path is None or not onnx_path.exists():
+                fallback_order = ['int8', 'fp32', 'pruned30']
+                for variant in fallback_order:
+                    fallback_path = model_map.get(variant)
+                    if fallback_path and fallback_path.exists():
+                        onnx_path = fallback_path
+                        logger.warning(f"Requested {self.onnx_variant} not found, using {variant}")
+                        break
+            
+            if onnx_path is None or not onnx_path.exists():
+                logger.error("No ONNX model found. Run export_mobilehand.py first.")
+                self.use_onnx = False
+                self._init_pytorch(None)
+                return
+            
+            # Create ONNX session
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            self.onnx_session = ort.InferenceSession(str(onnx_path), providers=providers)
+            self.onnx_input_name = self.onnx_session.get_inputs()[0].name
+            self.available = True
+            logger.info(f"Loaded ONNX model: {onnx_path.name}")
+            
+        except ImportError:
+            logger.warning("onnxruntime not installed. Falling back to PyTorch.")
+            self.use_onnx = False
+            self._init_pytorch(None)
+        except Exception as e:
+            logger.error(f"ONNX init failed: {e}")
+            self.use_onnx = False
+            self._init_pytorch(None)
+
+    def _init_pytorch(self, model_path):
+        """Initialize PyTorch MobileHand model."""
+        try:
+            from mobilehand.model import HMR
+            logger.info("Initializing MobileHand model (PyTorch)...")
             self.model = HMR(dataset='freihand')
             self.model.to(self.device)
             self.model.eval()
@@ -68,9 +125,10 @@ class MobileHandPipeline:
         except FileNotFoundError as e:
             logger.error(f"MobileHand initialization failed: {e}")
             logger.error("Please ensure MANO_RIGHT.pkl is in assets/models/")
-            # Continue without MobileHand - will fallback to MediaPipe keypoints
+            return
         except Exception as e:
             logger.error(f"Unexpected error initializing MobileHand: {e}")
+            return
 
         # Load weights if available
         if self.available:
@@ -116,6 +174,7 @@ class MobileHandPipeline:
         """
         Run MobileHand on a cropped hand image.
         Returns keypoints in original frame coordinates.
+        Uses ONNX if available, otherwise PyTorch.
         """
         x1, y1, x2, y2 = bbox
         crop_h, crop_w = crop.shape[:2]
@@ -123,30 +182,41 @@ class MobileHandPipeline:
         # Resize to 224x224 for MobileHand
         img_resized = cv2.resize(crop, (224, 224))
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-        img_tensor = torch.from_numpy(img_rgb).float().permute(2, 0, 1) / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(self.device)
         
-        with torch.no_grad():
-            try:
-                keypt, joint, vert, ang, params = self.model(img_tensor)
-                keypt_np = keypt[0].cpu().numpy()  # [21, 2] in 224x224 coords
+        try:
+            if self.use_onnx and self.onnx_session is not None:
+                # ONNX inference
+                img_np = img_rgb.astype(np.float32).transpose(2, 0, 1) / 255.0
+                img_np = np.expand_dims(img_np, axis=0)
                 
-                # Scale back to crop coordinates
-                keypt_np[:, 0] *= (crop_w / 224.0)
-                keypt_np[:, 1] *= (crop_h / 224.0)
+                outputs = self.onnx_session.run(None, {self.onnx_input_name: img_np})
+                keypt_np = outputs[0][0]  # [21, 2] in 224x224 coords
+            else:
+                # PyTorch inference
+                img_tensor = torch.from_numpy(img_rgb).float().permute(2, 0, 1) / 255.0
+                img_tensor = img_tensor.unsqueeze(0).to(self.device)
                 
-                # Translate to original frame coordinates
-                keypt_np[:, 0] += x1
-                keypt_np[:, 1] += y1
-                
-                # Add confidence column
-                ones = np.ones((21, 1), dtype=np.float32)
-                keypt_with_conf = np.hstack((keypt_np, ones))
-                
-                return keypt_with_conf
-            except Exception as e:
-                logger.error(f"MobileHand inference error: {e}")
-                return None
+                with torch.no_grad():
+                    keypt, joint, vert, ang, params = self.model(img_tensor)
+                    keypt_np = keypt[0].cpu().numpy()  # [21, 2] in 224x224 coords
+            
+            # Scale back to crop coordinates
+            keypt_np[:, 0] *= (crop_w / 224.0)
+            keypt_np[:, 1] *= (crop_h / 224.0)
+            
+            # Translate to original frame coordinates
+            keypt_np[:, 0] += x1
+            keypt_np[:, 1] += y1
+            
+            # Add confidence column
+            ones = np.ones((21, 1), dtype=np.float32)
+            keypt_with_conf = np.hstack((keypt_np, ones))
+            
+            return keypt_with_conf
+        except Exception as e:
+            logger.error(f"MobileHand inference error: {e}")
+            return None
+
 
     def _mediapipe_landmarks_to_array(self, hand_landmarks, w, h):
         """

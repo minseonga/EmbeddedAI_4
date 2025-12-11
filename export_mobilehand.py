@@ -220,7 +220,8 @@ def export_pruned(pruning_ratio=0.3):
     Apply structured pruning to MobileHand encoder (MobileNetV3 only).
     
     The MANO layer has fixed structure and cannot be pruned.
-    We prune only the encoder, then rebuild the regressor to match.
+    We prune internal encoder layers while PRESERVING the output dimension (576)
+    so the original regressor weights remain compatible.
     
     Args:
         pruning_ratio: Fraction of channels to prune (0.0-1.0)
@@ -231,7 +232,6 @@ def export_pruned(pruning_ratio=0.3):
     
     try:
         import torch_pruning as tp
-        from mobilehand.regressor import LinearModel
         
         model = load_mobilehand_model()
         
@@ -254,6 +254,19 @@ def export_pruned(pruning_ratio=0.3):
             original_size = original_features.shape[1]
             print(f"[Pruning] Original encoder output: {original_size}")
         
+        # === KEY: Ignore output layers to preserve 576-dim output ===
+        # This keeps the regressor weights compatible
+        ignored_layers = []
+        for name, module in encoder.named_modules():
+            # Skip the final conv layers that produce the 576-dim output
+            if 'conv.0' in name or 'conv.1' in name:  # Final conv layers
+                ignored_layers.append(module)
+            # Also ignore SE (squeeze-excitation) final layers to avoid breaking
+            if 'fc.2' in name:
+                ignored_layers.append(module)
+        
+        print(f"[Pruning] Ignoring {len(ignored_layers)} output layers")
+        
         # Create pruner for encoder only
         importance = tp.importance.MagnitudeImportance(p=2)
         pruner = tp.pruner.MagnitudePruner(
@@ -261,6 +274,7 @@ def export_pruned(pruning_ratio=0.3):
             example_inputs=dummy_input,
             importance=importance,
             pruning_ratio=pruning_ratio,
+            ignored_layers=ignored_layers,
         )
         
         # Apply pruning to encoder
@@ -272,37 +286,16 @@ def export_pruned(pruning_ratio=0.3):
         
         print(f"[Pruning] Encoder params after: {params_after:,} ({reduction:.1f}% reduction)")
         
-        # Get new encoder output size
+        # Verify encoder output size is preserved
         with torch.no_grad():
             new_features = encoder(dummy_input)
             new_size = new_features.shape[1]
             print(f"[Pruning] New encoder output: {new_size}")
         
-        # Rebuild regressor with new input size
         if new_size != original_size:
-            print(f"[Pruning] Rebuilding regressor: {original_size} → {new_size}")
-            
-            # Import Regressor class
-            from mobilehand.model import Regressor
-            
-            # Create new regressor with correct input size
-            num_param = model.num_param
-            new_regressor = Regressor(
-                fc_layers=[new_size + num_param, 
-                           int(new_size/2), 
-                           int(new_size/2),
-                           num_param],
-                use_dropout=[True, True, False], 
-                drop_prob=[0.5, 0.5, 0], 
-                use_ac_func=[True, True, False],
-                num_param=num_param,
-                num_iters=3,
-                max_batch_size=model.max_batch_size
-            )
-            
-            # Replace regressor in model
-            model.regressor = new_regressor
-            print(f"[Pruning] Regressor rebuilt successfully")
+            print(f"[Warning] Output size changed! Regressor may not work.")
+        else:
+            print(f"[Pruning] ✓ Output size preserved - regressor compatible!")
         
         # Calculate total model reduction
         total_after = sum(p.numel() for p in model.parameters())

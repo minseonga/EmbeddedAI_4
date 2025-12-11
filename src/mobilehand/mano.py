@@ -10,6 +10,21 @@ import numpy as np
 import torch.nn as nn
 from pathlib import Path
 
+# === Numpy compatibility patch for numpy >= 1.20 ===
+# Older libraries like chumpy use np.bool, np.int, etc. which are deprecated
+if not hasattr(np, 'bool'):
+    np.bool = bool
+if not hasattr(np, 'int'):
+    np.int = int
+if not hasattr(np, 'float'):
+    np.float = float
+if not hasattr(np, 'complex'):
+    np.complex = complex
+if not hasattr(np, 'object'):
+    np.object = object
+if not hasattr(np, 'str'):
+    np.str = str
+
 # Updated import for local structure
 from .lbs import lbs
 

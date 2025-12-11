@@ -1,14 +1,24 @@
 """
 Emoji Reactor - Hand & Face Tracking
 
+Usage:
+  # YOLO (default)
+  python app.py --no-gstreamer
+
+  # MobileHand with different ONNX models:
+  python app.py --model-type mobilehand --onnx-model fp32 --no-gstreamer     # FP32 (7MB)
+  python app.py --model-type mobilehand --onnx-model int8 --no-gstreamer     # INT8 (2MB, default)
+  python app.py --model-type mobilehand --onnx-model pruned30 --no-gstreamer # Pruned 30%
+  python app.py --model-type mobilehand --onnx-model pruned50 --no-gstreamer # Pruned 50%
+  python app.py --model-type mobilehand --onnx-model pytorch --no-gstreamer  # PyTorch (slowest)
+
+  # Jetson Nano (GStreamer camera)
+  python app.py --model-type mobilehand --onnx-model int8
+
 States:
 - HANDS_UP      : hand above --raise-thresh
 - SMILING       : mouth aspect ratio > --smile-thresh
 - STRAIGHT_FACE : default
-
-Run:
-  python app.py --no-gstreamer --camera 0   # PC/Mac
-  python app.py                              # Jetson Nano (GStreamer)
 """
 
 import argparse
@@ -137,6 +147,8 @@ def main():
     parser.add_argument('--no-mirror', action='store_true')
     parser.add_argument('--no-gstreamer', action='store_true')
     parser.add_argument('--model-type', choices=['yolo', 'mobilehand'], default='yolo', help='Model to use')
+    parser.add_argument('--onnx-model', choices=['fp32', 'int8', 'pruned30', 'pruned50', 'pytorch'], 
+                        default='int8', help='MobileHand ONNX model variant')
     args = parser.parse_args()
 
     emojis = load_emojis()
@@ -156,6 +168,11 @@ def main():
             print(f"[Warning] Music not found: {music_path}")
     except ImportError:
         print("pygame not installed. Audio disabled.")
+        HAS_AUDIO = False
+    except Exception as e:
+        # Handle pygame mixer init failures (e.g., TLS memory issues on Jetson)
+        print(f"[Audio] pygame mixer init failed: {e}")
+        print("[Audio] Audio disabled. App will continue without music.")
         HAS_AUDIO = False
 
     # Camera (GStreamer for Jetson Nano)
@@ -189,7 +206,7 @@ def main():
         print("[Init] MobileHand Pipeline...")
         try:
             from hand_tracking.mobilehand_pipeline import MobileHandPipeline
-            pipeline = MobileHandPipeline()
+            pipeline = MobileHandPipeline(onnx_variant=args.onnx_model)
         except Exception as e:
             print(f"[Error] Failed to load MobileHand: {e}")
             return
