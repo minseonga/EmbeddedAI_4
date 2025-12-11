@@ -5,9 +5,8 @@ Usage:
   python3.8 src/emoji_reactor/app.py --no-music  # 음악 끄기
 """
 
-# =========================================================
-# [1] 긴급 패치: NumPy 1.24+ 호환성 (제일 먼저!)
-# =========================================================
+
+
 import numpy as np
 import signal
 import sys
@@ -36,31 +35,27 @@ try:
 except Exception:
     pass
 
-except Exception:
-    pass
-
-import cv2
-import argparse
-import os
-import sys
-import time
-from pathlib import Path
-
 # =========================================================
-# [2] Audio Setup (Lazy/Safe)
+# [2] 핵심 수정: Pygame을 무조건 CV2보다 먼저 로딩 (충돌 방지)
 # =========================================================
-HAS_AUDIO = False
 try:
     import pygame
-    # Low latency buffer - critical for Jetson
-    pygame.mixer.pre_init(frequency=44100, size=-16, channels=1, buffer=512)
+    # 버퍼를 줄여서 오디오 렉을 최소화합니다
+    pygame.mixer.pre_init(frequency=44100, size=-16, channels=1, buffer=512) 
     pygame.mixer.init()
     HAS_AUDIO = True
     print("[Init] Audio system initialized.", flush=True)
 except Exception as e:
     print(f"[Warning] Audio disabled: {e}", flush=True)
+    HAS_AUDIO = False
 
-ROOT = Path(__file__).resolve().parents[2]
+# =========================================================
+# [3] 나머지 라이브러리 로딩
+# =========================================================
+import cv2  # 이제 안전합니다
+import argparse
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -188,9 +183,8 @@ def main():
         try:
             from hand_tracking.mobilehand_pipeline import MobileHandPipeline
             print("[Init] Imported MobileHandPipeline class.", flush=True)
-            # Use lite_mode=True to prevent Jetson Nano crash (Memory/FaceMesh)
-            pipeline = MobileHandPipeline(onnx_variant=args.onnx_model, lite_mode=True)
-            print("[Init] MobileHandPipeline initialized (Lite Mode).", flush=True)
+            pipeline = MobileHandPipeline(onnx_variant=args.onnx_model)
+            print("[Init] MobileHandPipeline initialized.", flush=True)
         except Exception as e:
             print(f"[Error] MobileHand Load Failed: {e}", flush=True)
             import traceback
